@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:crypto/crypto.dart';
 
 import 'sherpa_speech.dart';
+import 'backend_provider.dart';
 
 const _brandPrimaryLight = Color(0xFF214B3A);
 const _brandSecondaryLight = Color(0xFF5F806D);
@@ -617,6 +618,7 @@ class PslRecognitionProvider {
 
 class AppController extends ChangeNotifier {
   final LocalStore store = LocalStore();
+  final BackendProvider backend = BackendProvider();
 
   AppController() {
     sherpaSpeechProvider.setListeners(
@@ -720,6 +722,7 @@ class AppController extends ChangeNotifier {
   ];
 
   Future<void> load() async {
+    await backend.init();
     onboardingComplete = (await store.get('onboarding_complete')) == 'true';
     final settingsJson = await store.get('settings');
     if (settingsJson != null) {
@@ -846,6 +849,7 @@ class AppController extends ChangeNotifier {
   Future<void> deleteProfessionalRecord(ProfessionalRecord record) async {
     records.removeWhere((item) => item.id == record.id);
     if (activeRecord?.id == record.id) activeRecord = null;
+    if (backend.isAuthenticated) await backend.deleteRecord(record.id);
     await persistRecords();
     notifyListeners();
   }
@@ -856,25 +860,37 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> saveLocalAccount({
+  Future<String?> saveLocalAccount({
     required String email,
     required String username,
     required String password,
     required LocalGender gender,
+    bool isLogin = false,
     String? displayName,
   }) async {
     final cleanEmail = email.trim();
     final cleanUsername = username.trim();
     final cleanDisplayName = (displayName ?? cleanUsername).trim();
+    
+    bool success = false;
+    if (isLogin) {
+      success = await backend.login(cleanUsername, password);
+    } else {
+      success = await backend.register(cleanEmail, cleanUsername, password, gender.name);
+    }
+
+    if (!success) {
+      return isLogin ? 'Invalid username or password.' : 'Could not create account. Username might be taken.';
+    }
+
     localEmail = cleanEmail;
     localUsername = cleanUsername;
     localDisplayName = cleanDisplayName.isEmpty ? cleanUsername : cleanDisplayName;
     localGender = gender;
     localAvatar = gender == LocalGender.female ? 'face' : 'person';
-    // Only a salted digest is retained; the plaintext password never enters the store.
-    final digest = sha256.convert(utf8.encode('humsukhan-local-v1:$cleanEmail:$password')).toString();
-    localCredentialConfigured = password.trim().isNotEmpty;
+    localCredentialConfigured = true;
     localLoginComplete = true;
+    
     await store.set(
       'local_profile',
       jsonEncode({
@@ -884,11 +900,15 @@ class AppController extends ChangeNotifier {
         'gender': localGender.name,
         'avatar': localAvatar,
         'credential_configured': localCredentialConfigured,
-        'credential_digest': digest,
         'login_complete': localLoginComplete,
       }),
     );
+    
+    // Trigger initial sync
+    syncProfessionalData();
+    
     notifyListeners();
+    return null;
   }
 
   Future<void> saveLocalProfile({
@@ -1292,6 +1312,28 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
+  
+  Future<void> syncProfessionalData() async {
+    if (!backend.isAuthenticated) return;
+    
+    // Push local records that might not be on server
+    for (final record in records) {
+      await backend.syncRecord(record);
+    }
+    
+    // Pull from server
+    final remoteRecords = await backend.getRecords();
+    if (remoteRecords.isNotEmpty) {
+      for (final remote in remoteRecords) {
+        if (!records.any((r) => r.id == remote.id)) {
+          records.add(remote);
+        }
+      }
+      await persistRecords();
+      notifyListeners();
+    }
+  }
+
   Future<void> persistRecords() async {
     await store.set(
       'professional_records',
@@ -1659,6 +1701,7 @@ class _LocalLoginScreenState extends State<LocalLoginScreen> {
   LocalGender gender = LocalGender.preferNotToSay;
   String? error;
   bool saving = false;
+  bool isLoginMode = false;
 
   @override
   void dispose() {
@@ -1672,20 +1715,36 @@ class _LocalLoginScreenState extends State<LocalLoginScreen> {
     final e = email.text.trim();
     final u = username.text.trim();
     final p = password.text;
-    setState(() {
-      error = e.contains('@') && e.contains('.') && u.length >= 2 && p.length >= 4
-          ? null
-          : 'Enter a valid email, a username, and a password of at least 4 characters.';
-    });
+    
+    if (!isLoginMode) {
+      setState(() {
+        error = e.contains('@') && e.contains('.') && u.length >= 2 && p.length >= 4
+            ? null
+            : 'Enter a valid email, a username, and a password of at least 4 characters.';
+      });
+    } else {
+      setState(() {
+        error = u.length >= 2 && p.length >= 4
+            ? null
+            : 'Enter your username and password.';
+      });
+    }
+    
     if (error != null) return;
     setState(() => saving = true);
-    await widget.controller.saveLocalAccount(
+    final apiError = await widget.controller.saveLocalAccount(
       email: e,
       username: u,
       password: p,
       gender: gender,
+      isLogin: isLoginMode,
     );
-    if (mounted) setState(() => saving = false);
+    if (mounted) {
+      setState(() {
+        saving = false;
+        error = apiError;
+      });
+    }
   }
 
   @override
@@ -1703,20 +1762,24 @@ class _LocalLoginScreenState extends State<LocalLoginScreen> {
                 const SizedBox(height: HKSpace.lg),
                 Text('Set up HumSukhan', style: Theme.of(context).textTheme.displaySmall, textAlign: TextAlign.center),
                 const SizedBox(height: HKSpace.sm),
-                Text('Create a private profile for this device. No cloud account or network sign-in is created.', style: Theme.of(context).textTheme.bodyLarge?.copyWith(color: scheme.onSurfaceVariant), textAlign: TextAlign.center),
+                Text(isLoginMode ? 'Sign in to your HumSukhan account to sync your data.' : 'Create a profile to sync your data and access AI features.', style: Theme.of(context).textTheme.bodyLarge?.copyWith(color: scheme.onSurfaceVariant), textAlign: TextAlign.center),
                 const SizedBox(height: HKSpace.xl),
                 Card(
                   child: Padding(
                     padding: const EdgeInsets.all(HKSpace.lg),
                     child: Column(
                       children: [
-                        TextField(controller: email, keyboardType: TextInputType.emailAddress, decoration: const InputDecoration(labelText: 'Email address', prefixIcon: Icon(Icons.alternate_email))),
-                        const SizedBox(height: HKSpace.sm),
+                        if (!isLoginMode) ...[
+                          TextField(controller: email, keyboardType: TextInputType.emailAddress, decoration: const InputDecoration(labelText: 'Email address', prefixIcon: Icon(Icons.alternate_email))),
+                          const SizedBox(height: HKSpace.sm),
+                        ],
                         TextField(controller: username, decoration: const InputDecoration(labelText: 'Username', prefixIcon: Icon(Icons.person_outline))),
                         const SizedBox(height: HKSpace.sm),
-                        TextField(controller: password, obscureText: true, decoration: const InputDecoration(labelText: 'Password', helperText: 'Only a secure digest is kept on this device.', prefixIcon: Icon(Icons.lock_outline))),
-                        const SizedBox(height: HKSpace.sm),
-                        _DropdownField<LocalGender>(label: 'Gender for your first-start tutor', value: gender, values: LocalGender.values, labelOf: (value) => value.label, onChanged: (value) => setState(() => gender = value)),
+                        TextField(controller: password, obscureText: true, decoration: const InputDecoration(labelText: 'Password', helperText: 'Your data is encrypted and private.', prefixIcon: Icon(Icons.lock_outline))),
+                        if (!isLoginMode) ...[
+                          const SizedBox(height: HKSpace.sm),
+                          _DropdownField<LocalGender>(label: 'Gender for your first-start tutor', value: gender, values: LocalGender.values, labelOf: (value) => value.label, onChanged: (value) => setState(() => gender = value)),
+                        ],
                         if (error != null) ...[
                           const SizedBox(height: HKSpace.sm),
                           Align(alignment: Alignment.centerLeft, child: Text(error!, style: TextStyle(color: scheme.error))),
@@ -1726,9 +1789,17 @@ class _LocalLoginScreenState extends State<LocalLoginScreen> {
                   ),
                 ),
                 const SizedBox(height: HKSpace.lg),
-                FilledButton.icon(onPressed: saving ? null : continueToGuide, icon: const Icon(Icons.arrow_forward_rounded), label: Text(saving ? 'Saving locally…' : 'Continue to your guide')),
+                FilledButton.icon(onPressed: saving ? null : continueToGuide, icon: const Icon(Icons.arrow_forward_rounded), label: Text(saving ? (isLoginMode ? 'Signing in...' : 'Creating account...') : (isLoginMode ? 'Sign In' : 'Create Profile'))),
                 const SizedBox(height: HKSpace.sm),
-                Text('You can edit your local profile later from Settings.', style: Theme.of(context).textTheme.bodySmall, textAlign: TextAlign.center),
+                                const SizedBox(height: HKSpace.sm),
+                TextButton(
+                  onPressed: () => setState(() {
+                    isLoginMode = !isLoginMode;
+                    error = null;
+                  }),
+                  child: Text(isLoginMode ? "Don't have an account? Create one" : "Already have an account? Sign in"),
+                ),
+                Text('You can edit your profile later from Settings.', style: Theme.of(context).textTheme.bodySmall, textAlign: TextAlign.center),
               ],
             ),
           ),

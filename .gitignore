@@ -1,0 +1,19 @@
+# Large binaries and build artifacts
+build/
+.dart_tool/
+.gradle/
+.idea/
+android/.gradle/
+android/app/build/
+ios/
+*.apk
+*.zip
+*.log
+
+# Large offline models (already available via Sherpa-ONNX download links)
+assets/models/
+
+# Local configuration and secrets
+.env
+.manus-logs/
+local.properties
